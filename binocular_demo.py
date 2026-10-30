@@ -1,10 +1,11 @@
-"""Binocular eye-tracking demo for two GC0308 USB cameras on Windows.
+"""Binocular eye-tracking demo for two GC0308 USB cameras on Windows and macOS.
 
 2D pupil fitting and the 3D eye model are ported from
 https://github.com/YutaItoh/3D-Eye-Tracker (MIT); see pupil_fitter.py and eye_model.py.
 
     run.bat                      # interactive demo
     run.bat --selftest 10        # headless check that both cameras stream
+    ./run.sh                     # the same on macOS
 """
 import argparse
 from collections import deque
@@ -18,7 +19,8 @@ import time
 import cv2
 import numpy as np
 
-from camera import FPS, HEIGHT, WIDTH, CameraStream, FpsMeter
+from camera import (DEFAULT_DEVICE, DEFAULT_LEFT, DEFAULT_RIGHT, FPS, HEIGHT, WIDTH, CameraStream, FpsMeter,
+                    format_ok, request_camera_access)
 from eye_model import EyeModelUpdater, ellipse_from_box, project_point
 from pupil_fitter import PupilFitter
 
@@ -106,6 +108,8 @@ class EyeTracker(threading.Thread):
         self.skipped = 0
         self.processed = 0
         self.result = None
+        self.sink = None         # optional callable(role, captured_time, pupil) for every frame
+        self.track_model = True
         self.stop_event = threading.Event()
         self.reset_model = threading.Event()
         self.more_samples = threading.Event()
@@ -150,8 +154,10 @@ class EyeTracker(threading.Thread):
             self.fitter.darkest_offset_low = self.settings.darkness_offset
             self.fitter.darkest_offset_high = self.settings.darkness_offset + 10
             pupil = self.fitter.fit(gray, roi)
+            if self.sink:
+                self.sink(self.stream.role, captured, pupil)
             model = None
-            if pupil:
+            if pupil and self.track_model:
                 ellipse = ellipse_from_box((pupil['center'], pupil['axes'], pupil['angle']), (WIDTH, HEIGHT))
                 model = self.model.update(ellipse)
             now = time.perf_counter()
@@ -528,7 +534,7 @@ class App:
                 ms = float(np.mean(s['ms'])) if s['ms'] else 0.0
                 fourcc = eye.stream.format.get('fourcc', '-')
                 size = f'{eye.stream.format.get("width", "-")}x{eye.stream.format.get("height", "-")}'
-                passed = (eye.stream.state == 'streaming' and fourcc == 'MJPG' and cap >= self.args.min_fps)
+                passed = (eye.stream.state == 'streaming' and format_ok(fourcc) and cap >= self.args.min_fps)
                 ok &= passed
                 report.append(f'{eye.role:5s} index {eye.stream.index}: {"PASS" if passed else "FAIL"}  '
                               f'state={eye.stream.state} format={fourcc} {size}  capture={cap:.1f} fps  '
@@ -547,10 +553,10 @@ class App:
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('--left', type=int, default=1, help='DirectShow index of the left-eye camera (rotated 180)')
-    p.add_argument('--right', type=int, default=2, help='DirectShow index of the right-eye camera')
-    p.add_argument('--device-name', default='USB Camera',
-                   help='Required DirectShow device name; "" disables the check')
+    p.add_argument('--left', type=int, default=DEFAULT_LEFT, help='Camera index of the left eye (rotated 180)')
+    p.add_argument('--right', type=int, default=DEFAULT_RIGHT, help='Camera index of the right eye')
+    p.add_argument('--device-name', default=DEFAULT_DEVICE,
+                   help='Required device name (macOS: modelID); "" disables the check')
     p.add_argument('--focal', type=float, default=280.0,
                    help='Focal length in pixels at 320x240 for the 3D model (estimate; default 280)')
     p.add_argument('--contrast', action='store_true', help='Start with contrast enhancement (CLAHE) on')
@@ -567,6 +573,10 @@ def main(argv=None):
     args = p.parse_args(argv)
     if args.left == args.right:
         p.error('--left and --right must be different camera indices')
+    if not request_camera_access():
+        print('Camera access is not granted. Allow your terminal app in System Settings > '
+              'Privacy & Security > Camera, then run this again.', file=sys.stderr)
+        return 1
     app = App(args)
     if args.selftest:
         return app.selftest(args.selftest, args.snapshot)

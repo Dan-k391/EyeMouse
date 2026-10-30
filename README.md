@@ -1,6 +1,6 @@
 # EyeMouse: binocular eye-tracking demo
 
-A Windows demo for two GC0308 USB eye cameras. It shows both feeds with fitted
+A Windows and macOS demo for two GC0308 USB eye cameras. It shows both feeds with fitted
 pupil ellipses and a per-eye 3D eye model, and can record to CSV. The 2D pupil
 fitter and 3D eye model are Python ports of
 [YutaItoh/3D-Eye-Tracker](https://github.com/YutaItoh/3D-Eye-Tracker) (MIT). See
@@ -29,6 +29,60 @@ Useful options (they also work with `run.bat`):
 | `--exposure -8` etc. | Optional manual exposure/brightness/gain/gamma. Defaults leave the driver settings alone. |
 | `--focal 280` | Focal length in pixels at 320×240 used by the 3D model (an estimate, see below). |
 | `--scale 1` | Smaller window. |
+
+On macOS, launch from Terminal.app instead:
+
+```bash
+./run.sh
+```
+
+The first run creates `.venv` with `python3` and asks for camera permission
+(run it from Terminal.app: apps without a camera prompt, such as some embedded
+shells, are refused). Three things differ from Windows:
+
+- Camera indices default to `--left 0 --right 1`, because OpenCV numbers cameras
+  in `uniqueID` order: the USB cameras sort before the FaceTime camera.
+- The two cameras report the same model, so nothing identifies which eye is
+  which. If the feeds are on the wrong side, press `x` or swap the indices.
+- AVFoundation decodes MJPG itself and offers 320×240 @ 120 FPS as `420v`, so
+  the MJPG check and the MJPG property order below do not apply.
+
+## Eye mouse (macOS)
+
+```bash
+./run.sh mouse              # calibrate, then control the cursor
+./run.sh mouse --reuse      # skip calibration, use the last one
+./run.sh mouse --no-click   # move the cursor only
+./run.sh mouse --calibrate-only   # measure accuracy and exit
+```
+
+Run it from Terminal.app, which needs Camera and Accessibility permission. It
+first shows both eye feeds and waits until both pupils are locked. Then follow
+13 dots with your eyes while keeping your head still, then 4 more that measure
+accuracy on points the fit never saw. The result is printed in screen points and
+saved to `calibrations/latest.json`.
+
+| Input | Action |
+|---|---|
+| Look | Moves the cursor |
+| Blink both eyes for 0.35–1.2 s | Left click, at the spot you looked at before the blink |
+| Blink both eyes for 1.2–2.5 s | Right click |
+| Move the real mouse or trackpad | Pauses eye control until it has been still for 2 s |
+| Hold Ctrl+Option, look at the frozen cursor, release | Corrects drift |
+| Tap Ctrl+Option+Cmd | Pause or resume |
+| Hold Ctrl+Option+Cmd for 2 s | Quit |
+| Esc | Cancel during calibration |
+
+Each eye gets a second-order polynomial from pupil position to screen position,
+and the two are averaged, weighted by validation error. Either eye alone still
+works, and an eye 3× worse than the other is dropped. The 3D eye model is not
+used: the cameras stay fixed relative to the eyes, so it adds nothing here, and
+it is turned off because failed rebuilds stall the tracker thread.
+
+The headset cannot see your head turn, so turning your head moves the cursor.
+Keep your head roughly still and use the drift correction after moving it.
+Recalibrate whenever the headset has been taken off, because `--reuse` assumes
+the cameras have not moved. Only the main display is supported.
 
 ## Controls
 

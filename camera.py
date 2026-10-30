@@ -1,4 +1,4 @@
-"""DirectShow capture thread for one GC0308 eye camera.
+"""DirectShow/AVFoundation capture thread for one GC0308 eye camera.
 
 Adapted from D:\\eyetrack\\capture.py (device-name guard, image controls). Each
 camera reads on its own thread so neither blocks the other at 120 FPS; both stay
@@ -6,24 +6,65 @@ in one process because separate processes can enumerate DirectShow devices in a
 different order.
 """
 from collections import deque
+import sys
 import threading
 import time
 
 import cv2
 
+IS_MAC = sys.platform == 'darwin'
 WIDTH, HEIGHT, FPS = 320, 240, 120
-EXPECTED_FOURCC = 'MJPG'
+# macOS converts MJPG inside AVFoundation and only exposes 320x240 @ 120 FPS as 420v.
+EXPECTED_FOURCC = None if IS_MAC else 'MJPG'
+BACKEND = cv2.CAP_AVFOUNDATION if IS_MAC else cv2.CAP_DSHOW
+# localizedName is translated on macOS, so match the stable modelID there instead.
+DEFAULT_DEVICE = 'UVC Camera VendorID_3141 ProductID_25446' if IS_MAC else 'USB Camera'
+DEFAULT_LEFT, DEFAULT_RIGHT = (0, 1) if IS_MAC else (1, 2)
 OPEN_RETRY_S = 2.0
 WARMUP_S = 1.0
 
 
 def fourcc_name(value):
     value = int(value)
+    if value < 0:  # AVFoundation does not report one
+        return 'native'
     text = ''.join(chr((value >> 8*i) & 0xFF) for i in range(4))
     return text if text.isprintable() and text.isascii() else f'0x{value:08X}'
 
 
+def format_ok(fourcc):
+    return EXPECTED_FOURCC is None or fourcc == EXPECTED_FOURCC
+
+
+def request_camera_access(timeout=60.0):
+    """Ask macOS for camera permission; True if granted. Windows has no such gate.
+
+    Must run on the main thread before the capture threads start: OpenCV's own
+    request does not wait for the answer, so the first open would just fail.
+    """
+    if not IS_MAC:
+        return True
+    import AVFoundation
+    from Foundation import NSDate, NSRunLoop
+    device, media = AVFoundation.AVCaptureDevice, AVFoundation.AVMediaTypeVideo
+    if device.authorizationStatusForMediaType_(media) == AVFoundation.AVAuthorizationStatusNotDetermined:
+        print('Waiting for the macOS camera permission prompt...', flush=True)
+        answered = threading.Event()
+        device.requestAccessForMediaType_completionHandler_(media, lambda granted: answered.set())
+        deadline = time.perf_counter() + timeout
+        while not answered.is_set() and time.perf_counter() < deadline:
+            NSRunLoop.mainRunLoop().runUntilDate_(NSDate.dateWithTimeIntervalSinceNow_(0.1))
+    return device.authorizationStatusForMediaType_(media) == AVFoundation.AVAuthorizationStatusAuthorized
+
+
 def device_names():
+    if IS_MAC:
+        import AVFoundation
+        device = AVFoundation.AVCaptureDevice
+        devices = (list(device.devicesWithMediaType_(AVFoundation.AVMediaTypeVideo))
+                   + list(device.devicesWithMediaType_(AVFoundation.AVMediaTypeMuxed)))
+        # OpenCV numbers cameras in uniqueID order, not AVFoundation's own order.
+        return [d.modelID() for d in sorted(devices, key=lambda d: d.uniqueID())]
     import comtypes
     from pygrabber.dshow_graph import FilterGraph
     comtypes.CoInitialize()
@@ -70,7 +111,7 @@ class FpsMeter:
 class CameraStream(threading.Thread):
     """Owns one cv2.VideoCapture. Publishes the newest frame; never queues stale ones."""
 
-    def __init__(self, role, index, rotate180=False, device_name='USB Camera', controls=None):
+    def __init__(self, role, index, rotate180=False, device_name=DEFAULT_DEVICE, controls=None):
         super().__init__(daemon=True, name=f'camera-{role}')
         self.role = role
         self.index = index
@@ -129,8 +170,8 @@ class CameraStream(threading.Thread):
     def _open(self):
         try:
             names = device_names()
-        except Exception as error:  # COM/pygrabber failure: report rather than guess
-            self._fail(f'Cannot list DirectShow cameras: {error}')
+        except Exception as error:  # COM/pygrabber/AVFoundation failure: report rather than guess
+            self._fail(f'Cannot list cameras: {error}')
             return None
         if self.index >= len(names):
             self._fail(f'No camera at index {self.index} (found {len(names)}: {", ".join(names) or "none"}). '
@@ -140,7 +181,7 @@ class CameraStream(threading.Thread):
             self._fail(f'Index {self.index} is "{names[self.index]}", not "{self.device_name}". '
                        f'Devices: {", ".join(f"{i}={n}" for i, n in enumerate(names))}')
             return None
-        cap = cv2.VideoCapture(self.index, cv2.CAP_DSHOW)
+        cap = cv2.VideoCapture(self.index, BACKEND)
         if not cap.isOpened():
             cap.release()
             self._fail(f'Could not open index {self.index}. Close other apps using it '
@@ -148,11 +189,12 @@ class CameraStream(threading.Thread):
             return None
         # Order matters on the GC0308: size and rate first, MJPG last. Setting MJPG
         # first silently falls back to washed-out YUY2 at 30 FPS.
-        self.message = f'Configuring {WIDTH}x{HEIGHT} @ {FPS} FPS {EXPECTED_FOURCC} (takes ~4 s)...'
+        self.message = f'Configuring {WIDTH}x{HEIGHT} @ {FPS} FPS {EXPECTED_FOURCC or ""} (takes ~4 s)...'
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, WIDTH)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, HEIGHT)
         cap.set(cv2.CAP_PROP_FPS, FPS)
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*EXPECTED_FOURCC))
+        if EXPECTED_FOURCC:
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*EXPECTED_FOURCC))
         self.control_report = apply_controls(cap, self.controls)
         self.format = dict(fourcc=fourcc_name(cap.get(cv2.CAP_PROP_FOURCC)),
                            width=int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
@@ -163,7 +205,7 @@ class CameraStream(threading.Thread):
     def _check_format(self, warmup_fps):
         warnings = []
         f = self.format
-        if f.get('fourcc') != EXPECTED_FOURCC:
+        if not format_ok(f.get('fourcc')):
             warnings.append(f'Format is {f.get("fourcc")}, not MJPG (expect washed-out 30 FPS)')
         if (f.get('width'), f.get('height')) != (WIDTH, HEIGHT):
             warnings.append(f'Size is {f.get("width")}x{f.get("height")}, not {WIDTH}x{HEIGHT}')
