@@ -84,6 +84,31 @@ Keep your head roughly still and use the drift correction after moving it.
 Recalibrate whenever the headset has been taken off, because `--reuse` assumes
 the cameras have not moved. Only the main display is supported.
 
+## Webcam mouse (macOS)
+
+No headset needed: this uses the built-in camera and MediaPipe's face landmarks.
+
+```bash
+./run.sh webcam                  # iris and head steer the cursor
+./run.sh webcam --mode head      # your nose steers it
+./run.sh webcam --reuse          # skip calibration, use the last one
+./run.sh webcam --no-click       # move the cursor only
+./run.sh webcam --calibrate-only # measure accuracy and exit
+```
+
+It needs `models/face_landmarker.task`, which is not in git. Download it from
+Google's [MediaPipe models](https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task)
+into `models/`. Face the camera directly with your face evenly lit.
+
+The controls are the same as the eye mouse. In `gaze` mode, calibration adds a
+step where you keep your eyes on a dot and turn your head, which teaches the
+mapping to ignore head movement. A webcam sees far less iris detail than a
+headset at 30 FPS rather than 120, so expect coarser aim. `head` mode gives up
+eye steering for a steadier cursor, so try it if `gaze` mode is too jittery.
+
+Calibration is stored separately in `calibrations/webcam.json`. Run `--reuse`
+only if you have not moved the camera or your seat.
+
 ## Controls
 
 | Input | Action |

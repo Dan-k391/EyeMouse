@@ -55,12 +55,14 @@ PAUSE_KEYS = {'control', 'option', 'command'}
 class Pupils:
     """Newest pupil of each eye, fed by the tracker threads."""
 
-    def __init__(self):
+    def __init__(self, roles=ROLES, max_age=MAX_AGE_S):
+        self.roles = roles
+        self.max_age = max_age
         self.lock = threading.Lock()
         self.latest = {}
         self.capture = None
-        self.seen = dict.fromkeys(ROLES, 0)
-        self.found = dict.fromkeys(ROLES, 0)
+        self.seen = dict.fromkeys(roles, 0)
+        self.found = dict.fromkeys(roles, 0)
 
     def __call__(self, role, captured, pupil):
         self.seen[role] += 1
@@ -75,7 +77,7 @@ class Pupils:
 
     def start_capture(self):
         with self.lock:
-            self.capture = {role: [] for role in ROLES}
+            self.capture = {role: [] for role in self.roles}
 
     def stop_capture(self):
         with self.lock:
@@ -84,19 +86,24 @@ class Pupils:
 
     def counts(self):
         with self.lock:
-            return {role: len(self.capture[role]) for role in ROLES} if self.capture else dict.fromkeys(ROLES, 0)
+            return ({role: len(self.capture[role]) for role in self.roles} if self.capture
+                    else dict.fromkeys(self.roles, 0))
 
     def take_stats(self):
         """Frames seen and pupils found per eye since the last call."""
-        stats = {role: (self.seen[role], self.found[role]) for role in ROLES}
-        self.seen = dict.fromkeys(ROLES, 0)
-        self.found = dict.fromkeys(ROLES, 0)
+        stats = {role: (self.seen[role], self.found[role]) for role in self.roles}
+        self.seen = dict.fromkeys(self.roles, 0)
+        self.found = dict.fromkeys(self.roles, 0)
         return stats
+
+    def visible(self, now):
+        """False when a lost gaze cannot be a blink. Pupils vanish behind the lids, so always True here."""
+        return True
 
     def fresh(self, now):
         with self.lock:
             return {role: (center, size) for role, (captured, center, size) in self.latest.items()
-                    if now - captured < MAX_AGE_S}
+                    if now - captured < self.max_age}
 
 
 class Aborted(Exception):
@@ -110,6 +117,8 @@ class Calibrator:
         self.pupils = pupils
         self.width, self.height = screen
         self.rect = (0, 0, *screen)
+        self.min_samples = MIN_TARGET_SAMPLES
+        self.prompt = ''
 
     def canvas(self):
         return np.full((self.height, self.width, 3), 70, np.uint8)
@@ -169,7 +178,8 @@ class Calibrator:
             for slot, eye in enumerate(eyes):
                 self.feed(canvas, eye, x0 + slot*(FEED_W + 40), y0)
             hint = 'Put the headset on and adjust it until both eyes are green. Esc cancels.'
-            cv2.putText(canvas, hint, (x0, y0 + FEED_H + 44), cv2.FONT_HERSHEY_SIMPLEX, .7, (240, 240, 240), 2, cv2.LINE_AA)
+            cv2.putText(canvas, hint, (x0, y0 + FEED_H + 44), cv2.FONT_HERSHEY_SIMPLEX, .7, (240, 240, 240), 2,
+                        cv2.LINE_AA)
             self.show(canvas)
             locked_at = (locked_at or now) if min(rates) >= ALIGN_RATE else None
             if locked_at and now - locked_at >= ALIGN_HOLD_S:
@@ -194,20 +204,24 @@ class Calibrator:
         canvas = self.canvas()
         cv2.circle(canvas, point, int(radius), (60, 200, 255), -1, cv2.LINE_AA)
         cv2.circle(canvas, point, 3, (0, 0, 0), -1, cv2.LINE_AA)
+        if self.prompt:
+            size = cv2.getTextSize(self.prompt, cv2.FONT_HERSHEY_SIMPLEX, .9, 2)[0]
+            cv2.putText(canvas, self.prompt, ((self.width - size[0])//2, self.height//2 - 70),
+                        cv2.FONT_HERSHEY_SIMPLEX, .9, (240, 240, 240), 2, cv2.LINE_AA)
         self.show(canvas)
 
-    def target(self, fraction):
+    def target(self, fraction, settle=SETTLE_S):
         """Show one target. Returns (screen_point, {role: samples}) after the eyes have settled."""
         point = self.canvas_point(fraction)
         start = time.perf_counter()
-        while (elapsed := time.perf_counter() - start) < SETTLE_S:
-            self.dot(point, 26 - 16*elapsed/SETTLE_S)
+        while (elapsed := time.perf_counter() - start) < settle:
+            self.dot(point, 26 - 16*elapsed/settle)
         self.pupils.start_capture()
         start = time.perf_counter()
         while True:
             elapsed = time.perf_counter() - start
             self.dot(point, 10)
-            enough = min(self.pupils.counts().values()) >= MIN_TARGET_SAMPLES
+            enough = min(self.pupils.counts().values()) >= self.min_samples
             if (elapsed >= COLLECT_S and enough) or elapsed >= TARGET_TIMEOUT_S:
                 break
         return self.screen_point(point), self.pupils.stop_capture()
@@ -390,7 +404,10 @@ class MouseLoop:
         self.frames += 1
         if gaze is None:
             self.lost += 1
-            self.blink.closed(now)
+            if self.pupils.visible(now):
+                self.blink.closed(now)
+            else:
+                self.blink.reset()
             return True
         smoothed = self.filter(now, gaze + self.offset)
         click = self.blink.opened(now, smoothed)
